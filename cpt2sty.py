@@ -2,16 +2,10 @@
 # -*- coding: utf-8 -*-
 
 """
-cpt2sty_v10.py
-
 CPT -> Yamaha SFF1 style converter with section-specific CASM generation.
 
-Main change in v10:
-- keeps generic CASM generation based on CPT data only
-- makes Cntt more explicit for each accompaniment family
-- forces Source Chord = 7 (byte 0x01, not 0x02/Maj7) for ChordPiano when Casio marks the track as 7th Chord / Variation Chord
-- keeps ChordGuitar data-driven, but also respects explicit 7th-chord Casio tagging
-- preserves name-independent behavior
+SysEx events include SMF lengths. CASM source chords and transposition tables
+are encoded separately; Cntt uses the extended NTT numbering, not chord codes.
 """
 
 import argparse
@@ -83,7 +77,8 @@ def sysex_gm_on():
     return bytes.fromhex("F0 05 7E 7F 09 01 F7")
 
 def sysex_xg_on():
-    return bytes.fromhex("F0 43 10 4C 00 00 7E 00 F7")
+    payload = bytes.fromhex("43 10 4C 00 00 7E 00 F7")
+    return b"\xF0" + write_vlq(len(payload)) + payload
 
 SECTION_NAMES = {0x0: "Intro", 0x2: "Variation1", 0x3: "Variation2", 0x6: "Fill1", 0x7: "Fill2", 0xA: "Ending"}
 PART_NAMES = {0x0: "Drum", 0x3: "Bass", 0x5: "ChordPiano", 0x6: "ChordGuitar", 0x7: "Phrase"}
@@ -285,6 +280,9 @@ def parse_track_events(track_data):
             status = running_status
         raw = bytearray()
         raw.extend(track_data[event_start:pos])
+        if first < 0x80:
+            # Store self-contained events: tracks are later merged into one stream.
+            raw.append(status)
         if status == 0xFF:
             if pos >= len(track_data):
                 raise ValueError("Unexpected EOF in meta event")
@@ -400,6 +398,13 @@ def validate_cpt(cpt):
     for tr in cpt.tracks:
         if tr.element_id is None:
             add("warning", "UNMAPPED_TRACK", "Track %d is not referenced by element map" % tr.track_index, tr.track_index)
+        for ev in tr.events:
+            if ev.kind != "channel" or not any(value > 0x7F for value in ev.payload):
+                continue
+            if ev.event_type == "program_change":
+                add("warning", "PROGRAM_HIGH_BIT", "Program Change %d will be normalized to %d" % (ev.payload[0], ev.payload[0] & 0x7F), tr.track_index, event_index=ev.index)
+            else:
+                add("error", "INVALID_MIDI_DATA", "Channel event contains a data byte above 127", tr.track_index, event_index=ev.index)
     return issues
 
 def compute_ticks_per_bar(cpt):
@@ -469,14 +474,9 @@ BASE_CTAB_SECTION = {
     },
 }
 
-BASE_CNTT = {
-    "Main A": {"Drum": bytes.fromhex("0900"), "Bass": bytes.fromhex("0A81"), "ChordPiano": bytes.fromhex("0B01"), "ChordGuitar": bytes.fromhex("0C01"), "Phrase": bytes.fromhex("0E01")},
-    "Main B": {"Drum": bytes.fromhex("0900"), "Bass": bytes.fromhex("0A81"), "ChordPiano": bytes.fromhex("0B01"), "ChordGuitar": bytes.fromhex("0C01"), "Phrase": bytes.fromhex("0E01")},
-    "Fill In AA": {"Drum": bytes.fromhex("0900"), "Bass": bytes.fromhex("0A00"), "ChordPiano": bytes.fromhex("0B01"), "ChordGuitar": bytes.fromhex("0C01"), "Phrase": bytes.fromhex("0E01")},
-    "Fill In BB": {"Drum": bytes.fromhex("0900"), "Bass": bytes.fromhex("0A00"), "ChordPiano": bytes.fromhex("0B01"), "ChordGuitar": bytes.fromhex("0C01"), "Phrase": bytes.fromhex("0E00")},
-    "Intro A": {"Drum": bytes.fromhex("0900"), "Bass": bytes.fromhex("0A00"), "ChordPiano": bytes.fromhex("0B04"), "ChordGuitar": bytes.fromhex("0C04"), "Phrase": bytes.fromhex("0E01")},
-    "Ending A": {"Drum": bytes.fromhex("0900"), "Bass": bytes.fromhex("0A00"), "ChordPiano": bytes.fromhex("0B04"), "ChordGuitar": bytes.fromhex("0C04"), "Phrase": bytes.fromhex("0E01")},
-}
+# Ctab has the older NTT numbering; Cntt uses the extended numbering.
+CTAB_TO_CNTT_NTT = {0: 0, 1: 1, 2: 2, 3: 0x81, 4: 3, 5: 5}
+SOURCE_CHORD_CODES = {"C": 0x00, "Cmaj7": 0x02, "Cm": 0x08, "C7": 0x13}
 
 STYLE_OVERRIDES = {}
 
@@ -505,24 +505,6 @@ def get_cct_name(track):
 
 
 
-def get_note_pitch_classes(track):
-    pcs = set()
-    for ev in track.events:
-        if ev.event_type == "note_on" and len(ev.payload) >= 2 and ev.payload[1] > 0:
-            pcs.add(ev.payload[0] % 12)
-    return pcs
-
-def infer_harmony_from_notes(track):
-    pcs = get_note_pitch_classes(track)
-    return {
-        "has_minor_3rd": 3 in pcs,
-        "has_major_3rd": 4 in pcs,
-        "has_perfect_5th": 7 in pcs,
-        "has_minor_7th": 10 in pcs,
-        "has_major_7th": 11 in pcs,
-        "pitch_classes": sorted(pcs),
-    }
-
 def choose_source_chord_family(track, yamaha_section):
     part = track.element_info.get("part_name")
     cct_group = get_cct_group(track)
@@ -537,11 +519,8 @@ def choose_source_chord_family(track, yamaha_section):
             return "Cm"
         return "C"
 
-    # v6 fix:
-    # Yamaha chord-accompaniment parts are safer when their Source Chord reflects
-    # the way the source pattern was recorded, not the plain harmony we want to hear.
-    # In practice this means chord guitar must default to C7 for normal chord sections,
-    # otherwise Yamaha tends to keep/add the 7th during transposition.
+    # Preserve the existing CCT-based source-family policy. This is a heuristic
+    # for recording context, separate from the Yamaha NTT selection below.
     if part == "ChordGuitar":
         if cct_group in (
             "chord_minor",
@@ -646,75 +625,27 @@ def get_source_root(track):
 def make_ctab_default(track, yamaha_section):
     part = track.element_info.get("part_name")
     base = BASE_CTAB_SECTION[yamaha_section][part][:]
-
-    # Source Root is stored in Ctab, not in Cntt.
-    # Casio FF81.original_key gives the recorded key center (0=C, 5=F, ...).
-    # Yamaha expects that value in the Source Root field for accompaniment tracks.
+    source_family = choose_source_chord_family(track, yamaha_section)
     if part != "Drum":
         base[18] = get_source_root(track)
-
-    # Project rule:
-    # chord accompaniment tracks should default to Yamaha "Chord" NTT,
-    # not "Melody". This includes Phrase tracks that Casio itself tags
-    # with a chord-oriented CCT in Main/Fill sections.
+        if source_family in SOURCE_CHORD_CODES:
+            base[19] = SOURCE_CHORD_CODES[source_family]
     if should_use_chord_ntt(track, yamaha_section):
-        base[19] = 0x13
-    source_family = choose_source_chord_family(track, yamaha_section)
-    profile = choose_profile(track, yamaha_section)
-    return bytes(base), profile, source_family
+        base[21] = 0x02
+    if get_cct_group(track) == "phrase_no_change" and part != "Drum":
+        base[20] = 0x01  # Root Fixed + Bypass preserves recorded notes.
+        base[21] = 0x00
+    return bytes(base), choose_profile(track, yamaha_section), source_family
 
-def make_cntt_default(track, yamaha_section, source_family):
-    part = track.element_info.get("part_name")
-    cct_group = get_cct_group(track)
-    base = bytearray(BASE_CNTT[yamaha_section][part])
 
-    # Project rule:
-    # for accompaniment chord tracks in Main/Fill sections, Yamaha behaves
-    # more reliably when Source Chord defaults to dominant 7.
-    if part in ("ChordPiano", "ChordGuitar") and yamaha_section in ("Main A", "Main B", "Fill In AA", "Fill In BB"):
-        base[1] = 0x01
-    elif part == "ChordPiano":
-        if cct_group in ("chord_7th", "chord_var7"):
-            base[1] = 0x01
-        elif source_family == "Cm":
-            base[1] = 0x03
-        elif source_family == "C":
-            base[1] = 0x00
+def make_cntt_default(track, yamaha_section, ctab_payload):
+    # Derive the effective table from Ctab so a newer keyboard cannot override
+    # Chord with Melody. Source chord type belongs exclusively in Ctab[19].
+    ntt = CTAB_TO_CNTT_NTT[ctab_payload[21]]
+    if track.element_info.get("part_name") == "Bass" and yamaha_section in ("Main A", "Main B"):
+        ntt |= 0x80
+    return bytes([ctab_payload[0], ntt])
 
-    elif part == "ChordGuitar":
-        notes = infer_harmony_from_notes(track)
-        if cct_group in ("chord_7th", "chord_var7") or notes["has_minor_7th"]:
-            base[1] = 0x01
-        elif source_family == "Cm":
-            base[1] = 0x03
-        elif source_family == "C":
-            base[1] = 0x00
-
-    if part == "Bass":
-        if source_family == "Cm":
-            base[1] = 0x03
-        elif source_family == "C7":
-            base[1] = 0x01
-        else:
-            base[1] = base[1]
-
-    if part == "Phrase":
-        if is_phrase_chordal(track, yamaha_section):
-            if source_family in ("C7", "C"):
-                # Project rule: chordal phrase/accompaniment tracks in Main/Fill
-                # are more reliable on Yamaha when Source Chord defaults to 7.
-                base[1] = 0x01
-            elif source_family == "Cm":
-                base[1] = 0x03
-        else:
-            if source_family == "C7":
-                base[1] = 0x01
-            elif source_family == "Cm":
-                base[1] = 0x03
-            elif source_family == "C":
-                base[1] = 0x00
-
-    return bytes(base)
 
 def apply_style_override(cpt, yamaha_section, track, ctab_payload, cntt_payload):
     return ctab_payload, cntt_payload, False
@@ -723,6 +654,7 @@ def build_cseg_for_section(cpt, yamaha_section, tracks):
     payload = bytearray()
     payload.extend(chunk(b"Sdec", yamaha_section.encode("ascii", errors="replace")))
     report_tracks = []
+    cntt_chunks = []
     part_order = ["Drum", "Bass", "ChordPiano", "ChordGuitar", "Phrase"]
     for part_name in part_order:
         track = None
@@ -733,10 +665,10 @@ def build_cseg_for_section(cpt, yamaha_section, tracks):
         if track is None:
             continue
         ctab_payload, profile, source_family = make_ctab_default(track, yamaha_section)
-        cntt_payload = make_cntt_default(track, yamaha_section, source_family)
+        cntt_payload = make_cntt_default(track, yamaha_section, ctab_payload)
         ctab_payload, cntt_payload, used_override = apply_style_override(cpt, yamaha_section, track, ctab_payload, cntt_payload)
         payload.extend(chunk(b"Ctab", ctab_payload))
-        payload.extend(chunk(b"Cntt", cntt_payload))
+        cntt_chunks.append(chunk(b"Cntt", cntt_payload))
         report_tracks.append({
             "track_index": track.track_index,
             "part_name": part_name,
@@ -751,8 +683,14 @@ def build_cseg_for_section(cpt, yamaha_section, tracks):
             "ff82": track.ff82,
             "ctab_hex": ctab_payload.hex().upper(),
             "cntt_hex": cntt_payload.hex().upper(),
+            "source_root": ctab_payload[18],
+            "source_chord_code": ctab_payload[19],
+            "ctab_ntt": ctab_payload[21],
+            "cntt_ntt": cntt_payload[1] & 0x7F,
+            "bass_on": bool(cntt_payload[1] & 0x80),
             "used_style_override": used_override,
         })
+    payload.extend(b"".join(cntt_chunks))
     return chunk(b"CSEG", bytes(payload)), {"section": yamaha_section, "tracks": report_tracks}
 
 def build_casm(cpt):
@@ -782,7 +720,14 @@ def remap_channel_event(raw, target_channel_1based):
     if status < 0x80 or status >= 0xF0:
         return raw
     ch0 = (target_channel_1based - 1) & 0x0F
-    return bytes([(status & 0xF0) | ch0]) + raw[1:]
+    payload = raw[1:]
+    if (status & 0xF0) == 0xC0:
+        # Some CPT files set bit 7 in the program number. The supplied repairs
+        # retain the lower seven bits; never emit a MIDI status byte as data.
+        payload = bytes(value & 0x7F for value in payload)
+    if any(value > 0x7F for value in payload):
+        raise ValueError("Channel event contains a data byte above 127")
+    return bytes([(status & 0xF0) | ch0]) + payload
 
 def build_style_track(cpt):
     ticks_per_bar = compute_ticks_per_bar(cpt)
@@ -832,7 +777,7 @@ def build_style_track(cpt):
                     raw = remap_channel_event(ev.raw_bytes, target_ch)
                     add_event(current_start + ev.abs_time, raw)
         current_start += section_len
-    add_event(current_start + ticks_per_bar, b"\xFF\x2F\x00")
+    add_event(current_start, b"\xFF\x2F\x00")
     timeline.sort(key=lambda x: x[0])
     out = bytearray()
     last_tick = 0

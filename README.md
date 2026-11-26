@@ -1,119 +1,54 @@
-# CPT → Yamaha STY Converter
+# CPT to Yamaha STY Converter
 
-A Python tool for converting **Casio CPT styles** into **Yamaha SFF1 STY styles** with correct harmonic behavior.
-
----
-
-## Why this exists
-
-Casio CPT and Yamaha STY are structurally and behaviorally different style formats.
-
-A direct mechanical conversion is not sufficient, because Yamaha accompaniment playback depends on correctly configured:
-
-* **Source Root**
-* **Source Chord**
-* **NTT (Note Transposition Table)**
-
-Without that mapping, the resulting Yamaha style may produce incorrect harmony, such as:
-
-* unwanted major 7th chords
-* incorrect chord transposition
-* accompaniment parts behaving like melody tracks
-
-This project was created to solve that problem through reverse engineering of both the CPT format and Yamaha CASM behavior.
-
----
-
-## Features
-
-* Converts `.CPT` → `.STY` (Yamaha SFF1)
-* Generates CASM automatically
-* Correct handling of:
-
-  * Source Root
-  * Source Chord
-  * NTT (Chord vs Melody)
-* Works with:
-
-  * Casio factory styles
-  * third-party styles
-* Fully data-driven
-
----
-
-## Key Insight
-
-> CPT encodes how patterns were recorded, while Yamaha playback depends on how accompaniment tracks are interpreted during chord transposition.
-
-Correct Yamaha playback requires reconstructing that harmonic behavior from CPT data.
-
----
+Convert Casio CTK-731 CPT accompaniment patterns to Yamaha SFF1 STY files.
+Requires Python 3.10 or newer; conversion uses only the Python standard library.
 
 ## Usage
 
 ```bash
-python cpt2sty "input.CPT"
+python cpt2sty.py "input.CPT"
+python cpt2sty.py "input.CPT" -o "output.sty" --report "output.json"
 ```
 
-Output:
+The converter writes an STY and a JSON diagnostic report. Source files are
+unchanged. Invalid channel data prevents conversion, except for the observed
+Casio Program Change high bit: the program number is normalized to its lower
+seven bits and reported as a `PROGRAM_HIGH_BIT` warning.
 
-```text
-input.sty
+## Fixes in this update
+
+- Include the missing SMF length in XG System On SysEx messages.
+- Normalize high-bit Program Change values found in four supplied CPT files.
+- Expand running status before merging tracks onto different MIDI channels.
+- Store source chord types in Ctab, and NTT in Ctab/Cntt with the correct,
+  separate numbering. Keep Cntt consistent with Ctab and preserve Bass flags.
+- Write all Ctab records before Cntt records within each section.
+- End the MIDI track at the end of the last section without an extra empty bar.
+
+## Validation
+
+```bash
+python -m pip install -r requirements-dev.txt
+python -m unittest discover -s tests -v
 ```
 
----
+`mido` is a test dependency, not a converter runtime dependency. GitHub Actions
+runs the synthetic regressions, including a complete CPT-to-STY CLI conversion.
+If local `styles/` and `fixed styles/` folders are present, the tests also
+convert all available CPT files, load the results through mido, compare their
+MIDI events with the repairs, and check CASM consistency.
 
-## Project Structure
+The supplied corpus contains 139 original styles. All generated outputs load;
+16 Program Change values are normalized across ENDLESS, JINGLE, VAHDE and
+VOYAGE. MIDI events match the same-name repairs, with the final empty bar
+removed. This validates file structure and event preservation. Hardware playback
+and every manual harmonic edit in the three extra variants are not verified.
 
-```text
-/converter
-  cpt2sty.py
+## Format notes
 
-/docs
-  CPT_format.md
-  CASM_mapping.md
-  CASM_byte_level.md
-```
+- [CPT structure](docs/CPT_format.md)
+- [CPT to CASM policy and limitations](docs/CASM_mapping.md)
+- [CASM byte layout](docs/CASM_byte_level.md)
 
----
-
-## CPT Format
-
-The CPT format is not publicly documented.
-
-This project includes a reverse-engineered specification:
-
-* `docs/CPT_format.md`
-
----
-
-## Disclaimer
-
-* The CPT format documentation is unofficial
-* Some behaviors are based on reverse engineering and empirical testing
-* Not all edge cases may be covered yet
-
----
-
-## Tested With
-
-* Casio factory styles
-* third-party CPT styles
-* Yamaha Style Creator validation
-
----
-
-## Contributing
-
-Contributions are welcome, especially in:
-
-* decoding FF80 / FF81 / FF82 meta events
-* improving CCT interpretation
-* refining CASM generation
-* extending compatibility and testing
-
----
-
-## License
-
-MIT License (recommended)
+CPT decoding and source-family selection remain partly based on reverse
+engineering. See the mapping notes before adjusting harmonic rules.
